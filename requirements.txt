@@ -1,0 +1,6 @@
+send2trash
+watchdog
+py7zr
+charset-normalizer
+tkinterdnd2
+pywin32; sys_platform == "win32"

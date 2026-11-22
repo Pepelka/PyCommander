@@ -1,0 +1,29 @@
+[project]
+name = "pycommander"
+version = "0.2.0"
+description = "Dual-pane file manager inspired by Total Commander"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "send2trash",
+    "watchdog",
+    "py7zr",
+    "charset-normalizer",
+    "tkinterdnd2",
+]
+
+[project.optional-dependencies]
+windows = ["pywin32; sys_platform == 'win32'"]
+
+[project.scripts]
+pycommander = "pycommander.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "win32: requires Windows",
+]
+
+[tool.coverage.run]
+source = ["pycommander"]
+omit = ["pycommander/pane.py", "pycommander/app.py", "pycommander/compare_win.py", "pycommander/conflict.py"]
