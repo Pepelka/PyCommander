@@ -22,6 +22,7 @@ from pycommander.conflict import ConflictResolver
 from pycommander.operations import copy_file_with_conflict, copy_dir_with_conflict, move_with_conflict
 from pycommander.pane import FilePane
 from pycommander.compare_win import FileCompareWindow
+from pycommander.text_viewer import open_viewer, open_editor, open_text_window
 from pycommander.config import AppConfig
 from pycommander.delete_ops import delete_paths
 from pycommander.dialogs import (
@@ -80,6 +81,8 @@ class TotalCommanderApp(tk.Tk):
         self._fs_observer = None
         self._watch_path: str | None = None
         self._watch_refresh_after: str | None = None
+        self._watchdog_schedule_after: str | None = None
+        self._watchdog_gen = 0
         logging.basicConfig(level=logging.INFO)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -89,10 +92,10 @@ class TotalCommanderApp(tk.Tk):
         self._try_setup_dnd()
 
         self.active_pane: FilePane = self.left_pane
-        self.set_active_pane(self.left_pane)
-        if self._fs_observer is None and Observer is not None:
-            self._watch_path = None
-            self._setup_watchdog(self.left_pane.current_path)
+        self.left_pane.set_active_visual(True)
+        self.right_pane.set_active_visual(False)
+        self.cmd_prompt_var.set(f"{self.left_pane.current_path}>")
+        self._schedule_watchdog(self.left_pane)
         self.left_pane.tree.focus_set()
         plugin_loader.load_plugins(self)
 
@@ -157,6 +160,7 @@ class TotalCommanderApp(tk.Tk):
         )
         view_menu.add_command(label="Quick Filter (Ctrl+F)", command=self._focus_active_filter)
         view_menu.add_command(label="Quick View Panel", command=self.toggle_quick_view)
+        view_menu.add_command(label="File Watcher", command=self.toggle_file_watcher)
         menubar.add_cascade(label="View", menu=view_menu)
 
         cmd_menu = tk.Menu(menubar, tearoff=0)
@@ -276,11 +280,7 @@ class TotalCommanderApp(tk.Tk):
 
     def _on_close(self):
         self.app_config.flush()
-        if self._fs_observer:
-            try:
-                self._fs_observer.stop()
-            except Exception:
-                pass
+        self._stop_watchdog_async()
         self.destroy()
 
     def set_active_pane(self, pane: FilePane):
@@ -295,7 +295,29 @@ class TotalCommanderApp(tk.Tk):
             self.app_config.set("last_left_path", path_str)
         else:
             self.app_config.set("last_right_path", path_str)
-        self._setup_watchdog(pane.current_path)
+        self._schedule_watchdog(pane)
+
+    def toggle_file_watcher(self):
+        cur = bool(self.app_config.get("file_watcher_enabled"))
+        self.app_config.set("file_watcher_enabled", not cur)
+        if cur:
+            self._stop_watchdog_async()
+        else:
+            self._schedule_watchdog(self.active_pane)
+
+    def _schedule_watchdog(self, pane: FilePane):
+        if self._watchdog_schedule_after:
+            try:
+                self.after_cancel(self._watchdog_schedule_after)
+            except Exception:
+                pass
+        self._watchdog_schedule_after = self.after(200, lambda p=pane: self._run_scheduled_watchdog(p))
+
+    def _run_scheduled_watchdog(self, pane: FilePane):
+        self._watchdog_schedule_after = None
+        if pane is not self.active_pane:
+            return
+        self._setup_watchdog_async(pane.current_path)
 
     @property
     def inactive_pane(self) -> FilePane:
@@ -305,6 +327,7 @@ class TotalCommanderApp(tk.Tk):
         target = self.inactive_pane
         self.set_active_pane(target)
         target.tree.focus_set()
+        return "break"
 
     def refresh_both(self):
         self.left_pane.refresh(preserve_focus=True)
@@ -715,19 +738,7 @@ class TotalCommanderApp(tk.Tk):
             return
 
         try:
-            raw = get_file_bytes(path)[: 256 * 1024]  # Preview up to 256 KB
-            try:
-                content = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                # Format as Hex Dump for binary files
-                lines = []
-                for offset in range(0, min(len(raw), 16384), 16):
-                    chunk = raw[offset : offset + 16]
-                    hex_part = " ".join(f"{b:02X}" for b in chunk)
-                    ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-                    lines.append(f"{offset:08X}  {hex_part:<47}  {ascii_part}")
-                content = "[Binary File - Hex Preview (First 16 KB)]\n\n" + "\n".join(lines)
-            self._show_text_window(f"Lister (F3) - {path.name}", content, editable=False)
+            open_viewer(self, path, on_saved=self.refresh_both)
         except Exception as e:
             messagebox.showerror("View Error", f"Cannot read file:\n{e}")
 
@@ -744,65 +755,17 @@ class TotalCommanderApp(tk.Tk):
             )
             return
         try:
-            raw = path.read_bytes()
-            content = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            try:
-                from charset_normalizer import from_bytes
-
-                content = str(from_bytes(raw).best())
-            except Exception:
-                messagebox.showwarning("Binary File", "Cannot edit binary file in text editor.")
-                return
+            open_editor(self, path, on_saved=self.refresh_both)
         except Exception as e:
             messagebox.showerror("Edit Error", f"Cannot open file:\n{e}")
-            return
-
-        self._show_text_window(f"Editor (F4) - {path}", content, editable=True, save_path=path)
 
     def _show_text_window(
         self, title: str, content: str, editable: bool = False, save_path: Path | None = None
     ):
-        win = tk.Toplevel(self)
-        win.title(title)
-        win.geometry("800x580")
-
-        if editable and save_path:
-            toolbar = ttk.Frame(win, padding=4)
-            toolbar.pack(fill=tk.X)
-
-            def save_file():
-                try:
-                    new_text = text_widget.get("1.0", "end-1c")
-                    save_path.write_text(new_text, encoding="utf-8")
-                    self.refresh_both()
-                    win.destroy()
-                except Exception as e:
-                    messagebox.showerror("Save Error", str(e), parent=win)
-
-            ttk.Button(toolbar, text="💾 Save & Close (Ctrl+S)", command=save_file).pack(
-                side=tk.LEFT, padx=2
-            )
-            win.bind("<Control-s>", lambda e: save_file())
-
-        frame = ttk.Frame(win)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        text_widget = tk.Text(frame, wrap=tk.NONE, font=("Consolas", 10), undo=editable)
-        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text_widget.yview)
-        hsb = ttk.Scrollbar(win, orient=tk.HORIZONTAL, command=text_widget.xview)
-        text_widget.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-
-        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        hsb.pack(fill=tk.X)
-
-        text_widget.insert("1.0", content)
-        if not editable:
-            text_widget.configure(state=tk.DISABLED)
-
-        win.bind("<Escape>", lambda e: win.destroy())
-        text_widget.focus_set()
+        if save_path and editable:
+            open_editor(self, save_path, on_saved=self.refresh_both)
+        else:
+            open_text_window(self, title, content, editable=editable)
 
     def action_copy(self):
         """F5: Copy selected files/folders from active pane to inactive pane (extracts from archives)."""
@@ -1125,7 +1088,7 @@ class TotalCommanderApp(tk.Tk):
   - Within changed lines, differing words/parts are highlighted:
       red = removed, green = added, yellow = replaced
   - Synchronized scrolling in lockstep
-  - F7 / Down: Jump to next difference block
+  - F7 / Down: Jump to next difference block (in Compare window only)
   - Shift+F7 / Up: Jump to previous difference block
   - Options: Ignore whitespace, Ignore case, Re-compare
 
@@ -1133,16 +1096,27 @@ class TotalCommanderApp(tk.Tk):
   F1              Show this Help window
   F2              Rename focused file or folder in place
   F3              Lister / View:
-                    - Text files: built-in viewer
-                    - Binary files: Hex + ASCII dump preview
-                    - Folders / Archive folders: recursive size calculation
-  F4              Editor: open text file in built-in editor (Ctrl+S to save)
+                    - Encoding selector, line numbers, word wrap
+                    - Find (Ctrl+F, F3 next in window), hex view for binary
+                    - Up to 4 MB preview (folders: size summary)
+  F4              Editor: line numbers, find/replace (Ctrl+F / Ctrl+H)
+                    - Save Ctrl+S, save & close, go to line Ctrl+G, unsaved prompt
+                    - Encoding (auto / utf-8 / cp1252 / …), large-file confirm
   F5              Copy / Extract marked items from active to inactive pane
   F6              Move / Rename marked items to inactive pane
   F7              Create a new directory (MkDir) in the active pane
-  F8 / Delete     Delete marked items (with confirmation prompt)
+  F8 / Delete     Delete to Recycle Bin (confirm); Shift+Del = permanent delete
   F9              Open an external Terminal / Command Prompt in current folder
-  F10             Quit PyCommander
+  F10             Quit (settings saved on exit)
+
+[ LISTER & EDITOR WINDOW ]  (F3 / F4 — shortcuts apply inside this window)
+  Ctrl+F          Open find bar; Enter = next match, Shift+Enter = previous
+  F3 / Shift+F3   Find next / previous (stays in lister; does not open main F3)
+  Ctrl+H          Replace bar (editor only); Replace / Replace all
+  Ctrl+G          Go to line (editor)
+  Ctrl+S          Save (editor); toolbar Save & close
+  Match case      Checkbox in find bar (default: case-insensitive search)
+  Escape          Close lister/editor window (prompt if editor has unsaved changes)
 
 [ NAVIGATION ]
   Tab             Switch active focus between Left and Right panes
@@ -1158,6 +1132,25 @@ class TotalCommanderApp(tk.Tk):
   Drive Dropdown  Switch drive / root mount point
   Path Bar        Type any path (supports ~ and env vars) and press Enter
   Column Headers  Click Name / Ext / Size / Modified to sort asc/desc
+  Filter row      Type to filter visible names (live); Ctrl+F focuses filter field
+
+[ VIEW MENU ]
+  Show Hidden Files     Toggle hidden / dot files in listing
+  Quick Filter          Focus pane filter (Ctrl+F when focus is on file list)
+  Quick View Panel      Preview focused file in a strip under the pane
+  File Watcher          Auto-refresh active folder when files change (async)
+
+[ COMMANDS MENU ]
+  Sync Directory Summary    Compare left vs right pane folders (mtime/size)
+  Multi-Rename…               Pattern rename with preview ({name} {stem} {n:03d})
+  Search Files…               Name/content search under current folder
+  Find Duplicates…            Hash-based duplicate groups
+  Create ZIP from Selection   Pack marked/selected items into a .zip
+  Bookmarks / Add Bookmark    Saved paths; jump with Ctrl+1 … Ctrl+9
+
+[ CLIPBOARD & PANEL OPS ]
+  Ctrl+X / Ctrl+C / Ctrl+V    Cut / Copy / Paste files (in-app + Explorer list)
+  F5 / F6                     Copy / Move to other panel (Commander style)
 
 [ MARKING / SELECTION ]
   Insert          Toggle mark on current item (☑ red highlight) and move down
@@ -1270,20 +1263,43 @@ class TotalCommanderApp(tk.Tk):
         create_zip_from_selection(Path(dest), sources)
         self.active_pane.refresh()
 
-    def _setup_watchdog(self, path: Path):
-        if Observer is None or find_archive_root(path):
+    def _stop_watchdog_async(self):
+        self._watch_path = None
+        old = self._fs_observer
+        self._fs_observer = None
+        if not old:
+            return
+        self._watchdog_gen += 1
+
+        def stop_worker():
+            try:
+                old.stop()
+            except Exception:
+                pass
+            try:
+                old.join(timeout=0.25)
+            except Exception:
+                pass
+
+        threading.Thread(target=stop_worker, daemon=True).start()
+
+    def _setup_watchdog_async(self, path: Path):
+        """Restart folder watcher without blocking the UI (watchdog stop can take ~1s on Windows)."""
+        if Observer is None or not self.app_config.get("file_watcher_enabled"):
+            return
+        if find_archive_root(path):
+            self._stop_watchdog_async()
             return
         path_key = str(path)
         if path_key == self._watch_path and self._fs_observer is not None:
             return
+
         self._watch_path = path_key
-        if self._fs_observer:
-            try:
-                self._fs_observer.stop()
-                self._fs_observer.join(timeout=0.05)
-            except Exception:
-                pass
-            self._fs_observer = None
+        pane_ref = self.active_pane
+        self._watchdog_gen += 1
+        gen = self._watchdog_gen
+        old = self._fs_observer
+        self._fs_observer = None
 
         class _H(FileSystemEventHandler):
             def __init__(self, app_ref, pane_ref):
@@ -1301,14 +1317,35 @@ class TotalCommanderApp(tk.Tk):
                     1200, lambda: self.pane_ref.refresh(preserve_focus=True)
                 )
 
-        try:
-            obs = Observer()
-            obs.schedule(_H(self, self.active_pane), path_key, recursive=False)
-            obs.daemon = True
-            obs.start()
-            self._fs_observer = obs
-        except Exception as e:
-            LOG.warning("Watchdog unavailable: %s", e)
+        def start_observer():
+            if gen != self._watchdog_gen:
+                return
+            try:
+                obs = Observer()
+                obs.schedule(_H(self, pane_ref), path_key, recursive=False)
+                obs.daemon = True
+                obs.start()
+                if gen == self._watchdog_gen:
+                    self._fs_observer = obs
+            except Exception as e:
+                LOG.warning("Watchdog unavailable: %s", e)
+
+        def stop_then_start():
+            if old:
+                try:
+                    old.stop()
+                except Exception:
+                    pass
+                try:
+                    old.join(timeout=0.5)
+                except Exception:
+                    pass
+            self.after(0, start_observer)
+
+        if old:
+            threading.Thread(target=stop_then_start, daemon=True).start()
+        else:
+            start_observer()
 
     def _try_setup_dnd(self):
         if DND_FILES is None:

@@ -19,6 +19,7 @@ DEFAULTS: dict = {
     "refresh_cap": 5000,
     "compare_ignore_ws": False,
     "compare_ignore_case": False,
+    "file_watcher_enabled": True,
 }
 
 
