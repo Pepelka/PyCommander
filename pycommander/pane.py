@@ -20,6 +20,7 @@ from pycommander.utils import format_size, format_datetime, get_available_drives
 from pycommander.archives import is_archive_file, find_archive_root, list_archive_entries
 from pycommander.paths import get_path_info
 from pycommander.selection import resolve_selection_paths, filter_entries, is_hidden_entry
+from pycommander.session_paths import normalize_stored_path
 
 class FilePane(ttk.Frame):
     """Represents one side (left or right) of the dual-pane file browser."""
@@ -27,7 +28,7 @@ class FilePane(ttk.Frame):
     def __init__(self, parent, app, initial_path: Path):
         super().__init__(parent, padding=3)
         self.app = app
-        self.current_path = initial_path.resolve()
+        self.current_path = normalize_stored_path(initial_path)
         self.sort_col = "name"
         self.sort_reverse = False
         self.is_active = False
@@ -754,6 +755,8 @@ class FilePane(ttk.Frame):
 
         self._update_history_buttons()
         self.refresh(select_name=select_name)
+        if hasattr(self.app, "persist_pane_paths"):
+            self.app.persist_pane_paths()
 
     def go_up(self):
         parent = self.current_path.parent

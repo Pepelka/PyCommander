@@ -194,6 +194,13 @@ class ConflictResolver:
         self.overwrite_all = False
         self.skip_all = False
         self.cancelled = False
+        self.progress_dialog: "OperationProgressDialog | None" = None
+
+    def report_file(self, path: Path | str) -> None:
+        """Update progress detail while copying a single file inside a folder."""
+        if self.progress_dialog and not self.cancelled:
+            name = path.name if isinstance(path, Path) else str(path)
+            self.progress_dialog.set_detail(name)
 
     def resolve(self, src_info: dict, dst_info: dict, dst_path: Path) -> str:
         """

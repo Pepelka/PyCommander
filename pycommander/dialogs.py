@@ -11,28 +11,79 @@ from pycommander.duplicates import find_duplicates
 from pathlib import Path
 
 
+def center_toplevel_on_parent(win: tk.Toplevel, parent: tk.Misc) -> None:
+    """Place a dialog over the parent window (not at screen 0,0)."""
+    win.update_idletasks()
+    try:
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        w = max(win.winfo_reqwidth(), win.winfo_width())
+        h = max(win.winfo_reqheight(), win.winfo_height())
+        if pw <= 1 or ph <= 1:
+            parent.update_idletasks()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+        cx = max(0, px + (pw - w) // 2)
+        cy = max(0, py + (ph - h) // 2)
+        win.geometry(f"+{cx}+{cy}")
+    except tk.TclError:
+        pass
+
+
 class OperationProgressDialog(tk.Toplevel):
+    """Determinate progress bar with cancel for batch file operations."""
+
     def __init__(self, parent, title: str = "Working..."):
         super().__init__(parent)
         self.title(title)
         self.transient(parent)
+        self.resizable(False, False)
         self.cancelled = False
-        ttk.Label(self, text="Please wait…", padding=8).pack()
-        self.var = tk.StringVar(value="0 / 0")
-        ttk.Label(self, textvariable=self.var, padding=4).pack()
-        self.pb = ttk.Progressbar(self, mode="determinate", length=280)
-        self.pb.pack(padx=12, pady=4)
-        ttk.Button(self, text="Cancel", command=self._cancel).pack(pady=8)
+        self._on_cancel_cb = None
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        self.count_var = tk.StringVar(value="0 / 0")
+        ttk.Label(frm, textvariable=self.count_var).pack(anchor=tk.W)
+        self.detail_var = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=self.detail_var, wraplength=320).pack(anchor=tk.W, pady=(4, 6))
+        self.pb = ttk.Progressbar(frm, mode="determinate", length=320)
+        self.pb.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(frm, text="Cancel", command=self._cancel).pack(anchor=tk.E)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+        center_toplevel_on_parent(self, parent)
+        self.grab_set()
+
+    def set_on_cancel(self, callback):
+        self._on_cancel_cb = callback
 
     def _cancel(self):
         self.cancelled = True
+        if self._on_cancel_cb:
+            self._on_cancel_cb()
+
+    def set_detail(self, text: str):
+        self.detail_var.set(text)
+        self.update_idletasks()
 
     def update_progress(self, current: int, total: int, label: str = ""):
-        self.var.set(f"{current} / {total} {label}")
+        extra = f" — {label}" if label else ""
+        self.count_var.set(f"{current} / {total}{extra}")
         self.pb["maximum"] = max(1, total)
         self.pb["value"] = current
+        if label:
+            self.detail_var.set(label)
         self.update_idletasks()
+
+    def close(self):
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
 
 
 def show_multirename_dialog(parent, names: list[str], on_apply):

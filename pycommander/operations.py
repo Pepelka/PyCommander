@@ -15,6 +15,7 @@ def copy_file_with_conflict(src: Path, dst: Path, resolver: ConflictResolver) ->
     if resolver.cancelled:
         return "cancelled"
 
+    resolver.report_file(src)
     target_file = dst / src.name if dst.is_dir() else dst
 
     try:
@@ -57,6 +58,7 @@ def copy_dir_with_conflict(src_dir: Path, dst_dir: Path, resolver: ConflictResol
     for entry in src_dir.iterdir():
         if resolver.cancelled:
             return "cancelled"
+        resolver.report_file(entry)
         target = dst_dir / entry.name
         if entry.is_dir():
             res = copy_dir_with_conflict(entry, target, resolver)
@@ -77,6 +79,7 @@ def move_with_conflict(src: Path, dst: Path, resolver: ConflictResolver) -> str:
     if resolver.cancelled:
         return "cancelled"
 
+    resolver.report_file(src)
     target = dst / src.name if dst.is_dir() and not (dst.exists() and src.is_dir() and dst.name == src.name) else dst
 
     try:

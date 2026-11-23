@@ -15,7 +15,13 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from pathlib import Path
 
-from pycommander.archives import find_archive_root, list_archive_entries, extract_archive_item, is_archive_file
+from pycommander.archives import (
+    find_archive_root,
+    find_archive_extract_target,
+    list_archive_entries,
+    extract_archive_item,
+    is_archive_file,
+)
 from pycommander.utils import format_size, get_file_bytes, get_file_text
 from pycommander.paths import get_path_info
 from pycommander.conflict import ConflictResolver
@@ -23,10 +29,11 @@ from pycommander.operations import copy_file_with_conflict, copy_dir_with_confli
 from pycommander.pane import FilePane
 from pycommander.compare_win import FileCompareWindow
 from pycommander.text_viewer import open_viewer, open_editor, open_text_window
+from pycommander.session_paths import session_start_path
 from pycommander.config import AppConfig
-from pycommander.delete_ops import delete_paths
+from pycommander.delete_ops import delete_one_path
+from pycommander.file_batch import run_main_thread_batch
 from pycommander.dialogs import (
-    OperationProgressDialog,
     show_multirename_dialog,
     show_search_dialog,
     show_sync_summary,
@@ -189,10 +196,8 @@ class TotalCommanderApp(tk.Tk):
         self.paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=(4, 2))
 
         proj = Path(__file__).resolve().parent.parent
-        start_left = Path(self.app_config.get("last_left_path") or proj)
-        start_right = Path(self.app_config.get("last_right_path") or Path.home())
-        if not start_left.is_dir():
-            start_left = proj
+        start_left = session_start_path(self.app_config.get("last_left_path"), proj)
+        start_right = session_start_path(self.app_config.get("last_right_path"), Path.home())
 
         self.left_pane = FilePane(self.paned, self, start_left)
         self.right_pane = FilePane(self.paned, self, start_right)
@@ -278,7 +283,13 @@ class TotalCommanderApp(tk.Tk):
         self.bind("<Alt-Right>", lambda e: self.active_pane.history_forward())
         self.bind("<Alt-Down>", lambda e: self.active_pane.show_history_menu())
 
+    def persist_pane_paths(self):
+        """Remember both pane cwd values (including virtual archive paths)."""
+        self.app_config.set("last_left_path", str(self.left_pane.current_path))
+        self.app_config.set("last_right_path", str(self.right_pane.current_path))
+
     def _on_close(self):
+        self.persist_pane_paths()
         self.app_config.flush()
         self._stop_watchdog_async()
         self.destroy()
@@ -569,61 +580,46 @@ class TotalCommanderApp(tk.Tk):
         mode = clip.get("mode", "copy")
         sources = [Path(p) for p in clip["paths"]]
         # Drop missing sources
-        sources = [p for p in sources if p.exists() or find_archive_root(p)]
+        sources = [p for p in sources if p.exists() or find_archive_extract_target(p)]
         if not sources:
             self.file_clipboard = None
             messagebox.showinfo("Paste", "Clipboard items no longer exist.", parent=self)
             return
 
-        resolver = ConflictResolver(self)
-        errors: list[str] = []
-        for src in sources:
+        paste_mode = mode
+
+        def process_paste(src: Path, resolver: ConflictResolver, errors: list[str]):
             if resolver.cancelled:
-                break
-            try:
-                if mode == "cut":
-                    if find_archive_root(src):
-                        errors.append(f"{src.name}: cannot move out of archive via Paste (use F5 Copy)")
-                        continue
-                    dst = dest_dir / src.name
-                    if src.resolve() == dst.resolve():
-                        continue
-                    # Avoid moving a folder into itself
-                    try:
-                        if src.is_dir() and dest_dir.resolve().is_relative_to(src.resolve()):
-                            errors.append(f"{src.name}: cannot move folder into itself")
-                            continue
-                    except (OSError, ValueError):
-                        pass
-                    result = move_with_conflict(src, dst, resolver)
-                    if result == "cancelled":
-                        break
-                else:
-                    arch_info = find_archive_root(src)
-                    if arch_info:
-                        ok = extract_archive_item(arch_info[0], arch_info[1], dest_dir, resolver)
-                        if not ok and resolver.cancelled:
-                            break
-                    elif src.is_dir():
-                        result = copy_dir_with_conflict(src, dest_dir / src.name, resolver)
-                        if result == "cancelled":
-                            break
-                    else:
-                        result = copy_file_with_conflict(src, dest_dir, resolver)
-                        if result == "cancelled":
-                            break
-            except Exception as e:
-                errors.append(f"{src.name}: {e}")
+                return
+            if paste_mode == "cut":
+                if find_archive_extract_target(src):
+                    errors.append(f"{src.name}: cannot move out of archive via Paste (use F5 Copy)")
+                    return
+                dst = dest_dir / src.name
+                if src.resolve() == dst.resolve():
+                    return
+                try:
+                    if src.is_dir() and dest_dir.resolve().is_relative_to(src.resolve()):
+                        errors.append(f"{src.name}: cannot move folder into itself")
+                        return
+                except (OSError, ValueError):
+                    pass
+                if move_with_conflict(src, dst, resolver) == "cancelled":
+                    resolver.cancelled = True
+                return
+            self._copy_item_to_dir(src, dest_dir, resolver, errors)
 
-        if mode == "cut" and not resolver.cancelled:
-            self.file_clipboard = None
+        def finish_paste(errors: list[str], cancelled: bool):
+            if paste_mode == "cut" and not cancelled:
+                self.file_clipboard = None
+            if errors:
+                messagebox.showerror("Paste Errors", "\n".join(errors), parent=self)
+            self.refresh_both()
+            if len(sources) == 1 and not cancelled:
+                self.active_pane.refresh(select_name=sources[0].name)
 
-        if errors:
-            messagebox.showerror("Paste Errors", "\n".join(errors), parent=self)
-
-        self.refresh_both()
-        if len(sources) == 1 and not resolver.cancelled:
-            self.active_pane.refresh(select_name=sources[0].name)
+        title = "Moving…" if paste_mode == "cut" else "Pasting…"
+        run_main_thread_batch(self, title, sources, process_paste, finish_paste)
 
     def action_create_shortcut(self):
         """Create Windows .lnk shortcuts to selected items in the current folder."""
@@ -767,6 +763,22 @@ class TotalCommanderApp(tk.Tk):
         else:
             open_text_window(self, title, content, editable=editable)
 
+    def _copy_item_to_dir(
+        self, src: Path, target_dir: Path, resolver: ConflictResolver, errors: list[str]
+    ) -> None:
+        if resolver.cancelled:
+            return
+        arch_info = find_archive_extract_target(src)
+        if arch_info:
+            ok = extract_archive_item(arch_info[0], arch_info[1], target_dir, resolver)
+            if not ok and resolver.cancelled:
+                return
+        elif src.is_dir():
+            if copy_dir_with_conflict(src, target_dir / src.name, resolver) == "cancelled":
+                resolver.cancelled = True
+        elif copy_file_with_conflict(src, target_dir, resolver) == "cancelled":
+            resolver.cancelled = True
+
     def action_copy(self):
         """F5: Copy selected files/folders from active pane to inactive pane (extracts from archives)."""
         sources = self.active_pane.get_selected_paths()
@@ -796,60 +808,36 @@ class TotalCommanderApp(tk.Tk):
             return
         target_dir = Path(dest_str)
 
-        # Save cursor positions before operation
         active_focus = self.active_pane.tree.focus()
-        inactive_focus = self.inactive_pane.tree.focus()
-        active_scroll = self.active_pane.tree.yview()[0]
-        inactive_scroll = self.inactive_pane.tree.yview()[0]
 
-        resolver = ConflictResolver(self)
-        errors = []
-        for src in sources:
-            if resolver.cancelled:
-                break
-            try:
-                arch_info = find_archive_root(src)
-                if arch_info:
-                    ok = extract_archive_item(arch_info[0], arch_info[1], target_dir, resolver)
-                    if not ok and resolver.cancelled:
-                        break
-                elif src.is_dir():
-                    dst = target_dir / src.name
-                    result = copy_dir_with_conflict(src, dst, resolver)
-                    if result == "cancelled":
-                        break
-                else:
-                    result = copy_file_with_conflict(src, target_dir, resolver)
-                    if result == "cancelled":
-                        break
-            except Exception as e:
-                errors.append(f"{src.name}: {e}")
-
-        if errors:
-            messagebox.showerror("Copy Errors", "\n".join(errors))
-        if self.app_config.get("copy_verify_hash"):
+        def finish_copy(errors: list[str], cancelled: bool):
+            if self.app_config.get("copy_verify_hash") and not cancelled:
+                for src in sources:
+                    if src.is_file():
+                        dst = target_dir / src.name
+                        if dst.is_file() and not files_equal(src, dst):
+                            errors.append(f"Verify failed: {src.name}")
+            if errors:
+                messagebox.showerror("Copy Errors", "\n".join(errors), parent=self)
             for src in sources:
-                if src.is_file():
-                    dst = target_dir / src.name
-                    if dst.is_file() and not files_equal(src, dst):
-                        errors.append(f"Verify failed: {src.name}")
+                self.active_pane.marked_items.discard(src.name)
+            self.active_pane.refresh(
+                select_name=active_focus if active_focus and active_focus != ".." else None,
+                preserve_focus=True,
+            )
+            if len(sources) == 1 and not cancelled:
+                self.inactive_pane.refresh(select_name=sources[0].name)
+            else:
+                self.inactive_pane.refresh(preserve_focus=True)
+            self.cmd_prompt_var.set(f"{self.active_pane.current_path}>")
 
-        # Clear marks on successfully copied items in active pane
-        for src in sources:
-            self.active_pane.marked_items.discard(src.name)
-
-        # Refresh both panes while restoring positions
-        # Active pane: keep the cursor on the same item (files were not removed)
-        self.active_pane.refresh(
-            select_name=active_focus if active_focus and active_focus != ".." else None,
-            preserve_focus=True,
+        run_main_thread_batch(
+            self,
+            "Copying…",
+            sources,
+            lambda src, resolver, errors: self._copy_item_to_dir(src, target_dir, resolver, errors),
+            finish_copy,
         )
-        # Inactive pane: show newly arrived file; if single file copied, focus it; otherwise preserve
-        if len(sources) == 1 and not resolver.cancelled:
-            self.inactive_pane.refresh(select_name=sources[0].name)
-        else:
-            self.inactive_pane.refresh(preserve_focus=True)
-        self.cmd_prompt_var.set(f"{self.active_pane.current_path}>")
 
     def action_move(self):
         """F6: Move or rename selected files/folders to the target directory."""
@@ -871,56 +859,47 @@ class TotalCommanderApp(tk.Tk):
             return
         target_path = Path(dest_str)
 
-        # Save cursor positions before operation
         active_focus = self.active_pane.tree.focus()
-        # Find the item just before or after focused one, to land on after move
         all_children = list(self.active_pane.tree.get_children())
         try:
             focus_idx = all_children.index(active_focus)
         except ValueError:
             focus_idx = -1
+        multi = len(sources)
 
-        resolver = ConflictResolver(self)
-        errors = []
-        for src in sources:
+        def process_move(src: Path, resolver: ConflictResolver, errors: list[str]):
             if resolver.cancelled:
-                break
-            try:
-                if len(sources) == 1 and not target_path.is_dir():
-                    dst = target_path
-                else:
-                    dst = target_path / src.name
-                result = move_with_conflict(src, dst, resolver)
-                if result == "cancelled":
-                    break
-            except Exception as e:
-                errors.append(f"{src.name}: {e}")
+                return
+            if multi == 1 and not target_path.is_dir():
+                dst = target_path
+            else:
+                dst = target_path / src.name
+            if move_with_conflict(src, dst, resolver) == "cancelled":
+                resolver.cancelled = True
 
-        if errors:
-            messagebox.showerror("Move Errors", "\n".join(errors))
-
-        # Refresh active pane: land on the nearest surviving item
-        # Find next surviving item from original position
-        moved_names = {s.name for s in sources}
-        survivors = [c for c in all_children if c not in moved_names]
-        land_on = None
-        if survivors:
-            if focus_idx >= 0:
-                # Find first survivor at or after the original position
+        def finish_move(errors: list[str], cancelled: bool):
+            if errors:
+                messagebox.showerror("Move Errors", "\n".join(errors), parent=self)
+            moved_names = {s.name for s in sources}
+            survivors = [c for c in all_children if c not in moved_names]
+            land_on = None
+            if survivors and focus_idx >= 0:
                 for c in all_children[focus_idx:]:
                     if c in survivors:
                         land_on = c
                         break
                 if not land_on:
                     land_on = survivors[-1]
+            elif survivors:
+                land_on = survivors[-1]
+            self.active_pane.refresh(select_name=land_on, preserve_focus=(land_on is None))
+            if len(sources) == 1 and not cancelled:
+                self.inactive_pane.refresh(select_name=sources[0].name)
+            else:
+                self.inactive_pane.refresh(preserve_focus=True)
+            self.cmd_prompt_var.set(f"{self.active_pane.current_path}>")
 
-        self.active_pane.refresh(select_name=land_on, preserve_focus=(land_on is None))
-        # Inactive pane: focus newly moved item when single item
-        if len(sources) == 1 and not resolver.cancelled:
-            self.inactive_pane.refresh(select_name=sources[0].name)
-        else:
-            self.inactive_pane.refresh(preserve_focus=True)
-        self.cmd_prompt_var.set(f"{self.active_pane.current_path}>")
+        run_main_thread_batch(self, "Moving…", sources, process_move, finish_move)
 
     def action_mkdir(self):
         """F7: Create a new directory in the active pane."""
@@ -965,20 +944,22 @@ class TotalCommanderApp(tk.Tk):
         if not confirm:
             return
 
-        dlg = OperationProgressDialog(self, "Deleting…")
-        errors: list[str] = []
+        delete_perm = permanent
 
-        def worker():
-            errors.extend(delete_paths(sources, permanent=permanent))
-            self.after(0, lambda: self._finish_batch_delete(dlg, errors))
+        def process_delete(src: Path, resolver: ConflictResolver, errors: list[str]):
+            if resolver.cancelled:
+                return
+            err = delete_one_path(src, permanent=delete_perm)
+            if err:
+                errors.append(err)
 
-        threading.Thread(target=worker, daemon=True).start()
+        def finish_delete(errors: list[str], _cancelled: bool):
+            if errors:
+                messagebox.showerror("Delete Errors", "\n".join(errors), parent=self)
+            self.refresh_both()
 
-    def _finish_batch_delete(self, dlg: OperationProgressDialog, errors: list[str]):
-        dlg.destroy()
-        if errors:
-            messagebox.showerror("Delete Errors", "\n".join(errors), parent=self)
-        self.refresh_both()
+        title = "Deleting permanently…" if delete_perm else "Deleting…"
+        run_main_thread_batch(self, title, sources, process_delete, finish_delete)
 
     def action_compare(self):
         """Compare selected text files line by line (Compare by Content)."""
@@ -1078,7 +1059,7 @@ class TotalCommanderApp(tk.Tk):
   to browse inside it just like a regular directory!
   - 📁 [..] or BackSpace: Navigate up inside the archive, or exit to the real folder
   - F3 Lister: View file contents directly inside archives
-  - F5 Copy: Extract selected files/folders from archive into opposite panel
+  - F5 Copy: Inside archive, extracts members; on disk, copies .zip/.tar as a file
   - Alt+Enter: Inspect compressed member size, date, and archive details
 
 [ COMPARE BY CONTENT ]
@@ -1106,6 +1087,7 @@ class TotalCommanderApp(tk.Tk):
   F6              Move / Rename marked items to inactive pane
   F7              Create a new directory (MkDir) in the active pane
   F8 / Delete     Delete to Recycle Bin (confirm); Shift+Del = permanent delete
+  Copy/Move/Del   Progress bar with Cancel during F5, F6, F8, Paste, drag-and-drop
   F9              Open an external Terminal / Command Prompt in current folder
   F10             Quit (settings saved on exit)
 
@@ -1132,6 +1114,7 @@ class TotalCommanderApp(tk.Tk):
   Drive Dropdown  Switch drive / root mount point
   Path Bar        Type any path (supports ~ and env vars) and press Enter
   Column Headers  Click Name / Ext / Size / Modified to sort asc/desc
+  Session         Last left/right pane paths saved on exit (folders or inside archives)
   Filter row      Type to filter visible names (live); Ctrl+F focuses filter field
 
 [ VIEW MENU ]
@@ -1368,13 +1351,26 @@ class TotalCommanderApp(tk.Tk):
         if not paths:
             return
         dest = target_pane.current_path
-        resolver = ConflictResolver(self)
-        for src in paths:
-            if src.is_dir():
-                copy_dir_with_conflict(src, dest / src.name, resolver)
-            elif src.is_file():
-                copy_file_with_conflict(src, dest, resolver)
-        target_pane.refresh()
+        if find_archive_root(dest):
+            messagebox.showwarning(
+                "Archive Notice",
+                "Cannot drop files into an archive.",
+                parent=self,
+            )
+            return
+
+        def finish_drop(errors: list[str], _cancelled: bool):
+            if errors:
+                messagebox.showerror("Drop Errors", "\n".join(errors), parent=self)
+            target_pane.refresh()
+
+        run_main_thread_batch(
+            self,
+            "Copying…",
+            paths,
+            lambda src, resolver, errors: self._copy_item_to_dir(src, dest, resolver, errors),
+            finish_drop,
+        )
 
     def action_about(self):
         from pycommander import __version__

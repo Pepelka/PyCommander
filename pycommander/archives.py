@@ -61,6 +61,25 @@ def find_archive_root(path: Path) -> tuple[Path, str] | None:
     return None
 
 
+def find_archive_extract_target(path: Path) -> tuple[Path, str] | None:
+    """
+    Path inside an archive that should be extracted (not the .zip/.tar file on disk).
+    Returns (archive_path, internal_relpath) or None for normal file/directory copy.
+    """
+    info = find_archive_root(path)
+    if info is None:
+        return None
+    arch, rel = info
+    if not rel:
+        try:
+            if path.resolve() == arch.resolve():
+                return None
+        except OSError:
+            if path == arch:
+                return None
+    return info
+
+
 def list_archive_entries(archive_path: Path, relpath: str = "") -> list[dict]:
     """List direct children inside an archive at `relpath`."""
     relpath = relpath.strip("/").replace("\\", "/")
@@ -196,6 +215,8 @@ def extract_archive_item(archive_path: Path, relpath: str, dest_dir: Path, resol
                 if info.is_dir():
                     target_path.mkdir(parents=True, exist_ok=True)
                 else:
+                    if resolver:
+                        resolver.report_file(target_path)
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     if target_path.exists():
                         if resolver:
@@ -269,6 +290,8 @@ def extract_archive_item(archive_path: Path, relpath: str, dest_dir: Path, resol
                 if m.isdir():
                     target_path.mkdir(parents=True, exist_ok=True)
                 else:
+                    if resolver:
+                        resolver.report_file(target_path)
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     if target_path.exists():
                         if resolver:

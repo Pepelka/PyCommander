@@ -3,10 +3,20 @@ from pathlib import Path
 
 from pycommander.archives import (
     find_archive_root,
+    find_archive_extract_target,
     list_archive_entries,
     extract_archive_item,
     add_paths_to_zip,
 )
+
+
+def test_archive_file_copy_not_full_extract(tmp_path):
+    zpath = tmp_path / "t.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("inside.txt", "secret")
+    assert find_archive_extract_target(zpath) is None
+    member = tmp_path / "t.zip" / "inside.txt"
+    assert find_archive_extract_target(member) == (zpath.resolve(), "inside.txt")
 
 
 def test_zip_list_and_extract(tmp_path):
