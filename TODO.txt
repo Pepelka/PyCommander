@@ -1,0 +1,66 @@
+PyCommander — improvement backlog
+==================================
+
+Priority: quick wins
+--------------------
+[ ] Copy/move progress: prescan file count so the bar reflects files inside folders, not only top-level selection count.
+[ ] Copy/move: run shutil work off the UI thread; marshal conflict dialogs to main thread via queue.
+[ ] Cancel mid-folder: honour resolver.cancelled inside each file in copy_dir (already partial — verify extract too).
+[ ] GitHub Actions: pytest on push (3.10–3.12); optional Windows job.
+[ ] Split app.py: move F1 help to docs/help.txt or help_content.py; extract actions to pycommander/actions/.
+[ ] Unify batch runners: merge or document progress.py vs file_batch.py.
+[ ] README vs repo: align PyCommander.spec mention with what is actually in the tree.
+[ ] Pin versions in requirements.txt or add a lockfile for reproducible installs.
+
+Priority: UX / Total Commander parity
+-------------------------------------
+[ ] Archives: optional ZIP write (add/replace members); document read-only limits clearly.
+[ ] F2: inline rename in tree; batch rename conflicts.
+[ ] Search / duplicates: progress + cancel (avoid UI freeze on rglob).
+[ ] Sync: two-way sync with preview, not summary-only.
+[ ] Compare: side-by-side binary/hash; folder compare entry point.
+[ ] Properties: full attribute sheet (read-only, hidden; NTFS extras on Windows).
+[ ] Remember panedwindow sash position in config.
+[ ] Themes / configurable fonts.
+[ ] User-editable keyboard shortcut map.
+
+Priority: performance
+---------------------
+[ ] Non-blocking copy with periodic update_idletasks or threaded I/O.
+[ ] copy_verify_hash: progress and cancel for large files.
+[ ] Archive extract: stream large zip members instead of read-all into memory.
+[ ] refresh_cap UI when list truncated (“show all” / drill down).
+[ ] Watchdog: only real paths; avoid restarts on virtual archive paths.
+
+Priority: robustness
+--------------------
+[ ] Cross-volume move fallback (copy + delete).
+[ ] Windows long paths (\\?\ prefix) for deep trees.
+[ ] Guard when archive file is renamed/deleted while pane is inside it.
+[ ] Stronger confirm for bulk permanent delete.
+[ ] Shell command bar: optional confirm before run; document risks.
+
+Priority: testing & quality
+---------------------------
+[ ] Stop omitting app/pane/conflict from coverage or add integration tests instead.
+[ ] Unit tests: find_archive_extract_target, file_batch with fake parent.after.
+[ ] copy_dir_with_conflict cancelled mid-tree.
+[ ] More archive golden fixtures (tar, 7z).
+[ ] pytest-asyncio: set asyncio_default_fixture_loop_scope in pyproject.toml.
+
+Priority: packaging & docs
+--------------------------
+[ ] ARCHITECTURE.md (panes, archive VFS, config keys).
+[ ] plugins/README.md with register(app) example and security warning.
+[ ] CHANGELOG.md for user-visible fixes.
+
+Priority: security
+------------------
+[ ] Plugins: document arbitrary code execution; optional disable-by-default in config.
+
+Done / in progress (track here)
+-------------------------------
+[x] Session paths including inside archives (F10).
+[x] Copy archive file as file vs extract members (find_archive_extract_target).
+[x] Progress dialog + cancel for F5/F6/F8/paste/dnd; center dialog on main window.
+[x] Text lister/editor: gutter sync on PgUp/PgDown; focus + nav keys on open (text_viewer.py).

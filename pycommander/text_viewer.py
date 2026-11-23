@@ -11,6 +11,24 @@ ENCODINGS = ("auto", "utf-8", "utf-8-sig", "cp1252", "latin-1", "utf-16")
 
 MAX_VIEW_BYTES = 4 * 1024 * 1024
 
+# Keys that change scroll/caret but not line count (gutter must not rebuild).
+_NAV_SCROLL_KEYS = frozenset(
+    {
+        "Left",
+        "Right",
+        "Up",
+        "Down",
+        "Home",
+        "End",
+        "Prior",
+        "Next",
+        "Shift_L",
+        "Shift_R",
+        "Control_L",
+        "Control_R",
+    }
+)
+
 
 def detect_text_content(raw: bytes, encoding: str = "auto") -> tuple[str, str]:
     """Return (text, encoding_used). Uses charset_normalizer when auto."""
@@ -67,6 +85,7 @@ class TextWorkbench(tk.Toplevel):
         self._encoding = tk.StringVar(value="auto")
         self._wrap = tk.BooleanVar(value=False)
         self._find_case = tk.BooleanVar(value=False)
+        self._status_base = ""
 
         name = path.name if path else "Untitled"
         self.title(f"{'Editor' if editable else 'Lister'} - {name}")
@@ -81,10 +100,11 @@ class TextWorkbench(tk.Toplevel):
             self.text.insert("1.0", initial_content)
             if not editable:
                 self._apply_viewer_readonly()
-            self._refresh_gutter()
+            self._rebuild_gutter_lines()
             self._status.set(f"{len(initial_content):,} characters")
         self._apply_wrap()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after_idle(self._open_focus_text)
 
     def _build_ui(self):
         tb = ttk.Frame(self, padding=4)
@@ -137,25 +157,48 @@ class TextWorkbench(tk.Toplevel):
         body = ttk.Frame(self)
         body.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
 
-        self._gutter = tk.Text(body, width=5, padx=4, takefocus=0, borderwidth=0, state=tk.DISABLED,
-                               font=("Consolas", 10), background="#f0f0f0", foreground="#666666")
+        text_font = ("Consolas", 10)
+        line_opts = dict(
+            font=text_font,
+            spacing1=0,
+            spacing2=0,
+            spacing3=0,
+            borderwidth=0,
+            highlightthickness=0,
+            padx=2,
+            pady=0,
+        )
+        self._gutter = tk.Text(
+            body,
+            width=6,
+            takefocus=0,
+            state=tk.DISABLED,
+            background="#f0f0f0",
+            foreground="#666666",
+            **line_opts,
+        )
         self._gutter.pack(side=tk.LEFT, fill=tk.Y)
 
         self.text = tk.Text(
             body,
             wrap=tk.NONE,
-            font=("Consolas", 10),
             undo=self.editable,
-            borderwidth=1,
             relief=tk.SOLID,
+            **line_opts,
         )
+        self.text.configure(borderwidth=1)
         vsb = ttk.Scrollbar(body, orient=tk.VERTICAL)
+
+        def _yscroll_cmd(*args):
+            self.text.yview(*args)
+            self._sync_gutter_scroll()
+
         def _on_scroll(first, last):
             vsb.set(first, last)
-            self._gutter.yview_moveto(first)
+            self._sync_gutter_scroll()
 
         self.text.configure(yscrollcommand=_on_scroll)
-        vsb.configure(command=self.text.yview)
+        vsb.configure(command=_yscroll_cmd)
         self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -170,11 +213,15 @@ class TextWorkbench(tk.Toplevel):
         self.text.tag_raise("find_hit")
 
         self.text.bind("<KeyRelease>", self._on_text_changed)
-        self.text.bind("<Button-1>", lambda e: self.after_idle(self._refresh_gutter))
+        self.text.bind("<Button-1>", lambda e: self.after_idle(self._on_caret_moved))
+        self.text.bind("<ButtonRelease-1>", lambda e: self.after_idle(self._on_caret_moved))
         self.text.bind("<<Modified>>", self._on_modified)
+        self.text.bind("<MouseWheel>", lambda e: self.after_idle(self._sync_gutter_scroll))
+        self.text.bind("<Configure>", lambda e: self.after_idle(self._sync_gutter_scroll))
+
         for w in (self, self.text):
-            w.bind("<Control-f>", lambda e: (self._show_find(), "break"))
-            w.bind("<Control-F>", lambda e: (self._show_find(), "break"))
+            w.bind("<Control-f>", lambda e: (self._show_find(), "break")[1])
+            w.bind("<Control-F>", lambda e: (self._show_find(), "break")[1])
         self.bind("<Control-h>", lambda e: self._show_replace() if self.editable else None)
         self.bind("<Control-H>", lambda e: self._show_replace() if self.editable else None)
         self.bind("<Control-s>", lambda e: self._save())
@@ -182,6 +229,8 @@ class TextWorkbench(tk.Toplevel):
         self.bind("<F3>", lambda e: (self._find_next(), "break")[1])
         self.bind("<Shift-F3>", lambda e: (self._find_prev(), "break")[1])
         self.bind("<Escape>", lambda e: self._on_close())
+
+        self._bind_window_navigation()
 
     def _load_file(self):
         if not self.path:
@@ -230,14 +279,15 @@ class TextWorkbench(tk.Toplevel):
             self.text.edit_modified(False)
             self._modified = False
 
-        self._refresh_gutter()
+        self._rebuild_gutter_lines()
         try:
             size = self.path.stat().st_size if self.path and not find_archive_virtual(self.path) else len(raw)
         except OSError:
             size = len(raw)
         extra = " [truncated]" if truncated else ""
-        self._status.set(f"{format_size(size)} | encoding: {enc_label}{extra}")
+        self._status_base = f"{format_size(size)} | encoding: {enc_label}{extra}"
         self._update_title()
+        self._update_caret_status()
 
     def _toggle_hex(self):
         if not self._raw:
@@ -246,22 +296,101 @@ class TextWorkbench(tk.Toplevel):
         self._set_text_content(self._raw)
 
     def _apply_wrap(self):
-        self.text.configure(wrap=tk.WORD if self._wrap.get() else tk.NONE)
+        wrap_on = self._wrap.get()
+        self.text.configure(wrap=tk.WORD if wrap_on else tk.NONE)
+        if wrap_on:
+            self._gutter.pack_forget()
+        else:
+            if not self._gutter.winfo_ismapped():
+                self._gutter.pack(side=tk.LEFT, fill=tk.Y, before=self.text)
+        self.after_idle(self._rebuild_gutter_lines)
 
-    def _refresh_gutter(self):
+    def _open_focus_text(self):
+        try:
+            self.text.focus_set()
+        except tk.TclError:
+            pass
+
+    def _bind_window_navigation(self):
+        """Route PgUp/PgDown/arrows to the text area even when focus is on the window chrome."""
+
+        nav = (
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Prior",
+            "Next",
+        )
+
+        def forward(event):
+            w = event.widget
+            if isinstance(w, (ttk.Entry, tk.Entry)) or w is getattr(self, "_find_entry", None):
+                return None
+            if w is self.text:
+                self.after_idle(self._on_caret_moved)
+                return None
+            self.text.focus_set()
+            self.text.event_generate(f"<{event.keysym}>", when="tail")
+            self.after_idle(self._on_caret_moved)
+            return "break"
+
+        for key in nav:
+            self.bind(f"<{key}>", forward)
+            self.bind(f"<Shift-{key}>", forward)
+
+    def _sync_gutter_scroll(self):
+        """Keep gutter viewport aligned with the main text (no content rebuild)."""
+        try:
+            top = self.text.yview()[0]
+            self._gutter.yview_moveto(top)
+        except tk.TclError:
+            pass
+
+    def _rebuild_gutter_lines(self):
+        """Rebuild line-number text; preserve scroll position so PgUp/PgDown stay aligned."""
+        try:
+            yfirst = self.text.yview()[0]
+        except tk.TclError:
+            yfirst = 0.0
+        if self._wrap.get():
+            return
         self._gutter.configure(state=tk.NORMAL)
         self._gutter.delete("1.0", tk.END)
         end_line = int(self.text.index("end-1c").split(".")[0])
         nums = "\n".join(str(i) for i in range(1, end_line + 1))
         self._gutter.insert("1.0", nums)
         self._gutter.configure(state=tk.DISABLED)
+        self._gutter.yview_moveto(yfirst)
+        self._sync_gutter_scroll()
 
-    def _on_text_changed(self, event=None):
-        self.after_idle(self._refresh_gutter)
-        if self.editable:
+    def _on_caret_moved(self):
+        self._sync_gutter_scroll()
+        self._update_caret_status()
+
+    def _update_caret_status(self):
+        if not self.editable and self._hex_mode:
+            return
+        try:
             pos = self.text.index(tk.INSERT)
             line, col = pos.split(".")
-            self._status.set(f"Line {line}, col {int(col) + 1}")
+            total = int(self.text.index("end-1c").split(".")[0])
+            caret = f"Line {line} / {total}, col {int(col) + 1}"
+            if self._status_base:
+                self._status.set(f"{self._status_base}  |  {caret}")
+            else:
+                self._status.set(caret)
+        except tk.TclError:
+            pass
+
+    def _on_text_changed(self, event=None):
+        if event is not None and event.keysym in _NAV_SCROLL_KEYS:
+            self.after_idle(self._on_caret_moved)
+            return
+        self.after_idle(self._rebuild_gutter_lines)
+        self.after_idle(self._update_caret_status)
 
     def _on_modified(self, event=None):
         if self.editable and self.text.edit_modified():
@@ -423,7 +552,7 @@ class TextWorkbench(tk.Toplevel):
         self.text.insert("1.0", new)
         self._modified = True
         self._update_title()
-        self._refresh_gutter()
+        self._rebuild_gutter_lines()
         messagebox.showinfo("Replace", f"Replaced {count} occurrence(s).", parent=self)
 
     def _goto_line(self):
